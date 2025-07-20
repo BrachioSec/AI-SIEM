@@ -1,4 +1,4 @@
-# 🛡️ SIEM Tool v1.2.0
+# 🛡️ SIEM Tool v1.2.0(Readme is not up to date just starta a issue and google the erros)
 
 **Security Intelligence & Event Management (SIEM) - AI Powered, CLI First, Open Source**
 
@@ -38,7 +38,7 @@
 ### Setup
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/siem-tool.git
+https://github.com/BrachioSec/AI-SIEM.git
 cd siem-tool
 pip install -r requirements.txt
 ```
