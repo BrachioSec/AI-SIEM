@@ -1,10 +1,12 @@
-
 import os
 import json
 import argparse
 import logging
 import joblib
 import numpy as np
+# Set Agg backend BEFORE importing pyplot
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend
 import matplotlib.pyplot as plt
 from datetime import datetime
 from pathlib import Path
@@ -12,11 +14,15 @@ from transformers import AutoTokenizer, AutoModel
 import torch
 from sklearn.ensemble import RandomForestClassifier, IsolationForest
 from urllib.parse import urlparse
-import hashlib
 import csv
 import sys
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox, scrolledtext
+from PIL import Image, ImageTk
+import threading
+import queue
 
-VERSION = "1.2.0"
+VERSION = "2.0.1"
 DATA_DIR = Path("./siem_data")
 MODELS_DIR = DATA_DIR / "models"
 REPORTS_DIR = DATA_DIR / "reports"
@@ -38,120 +44,6 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger("SIEM-Tool")
-
-def print_banner():
-    print(f"""
-    ███████╗██╗███████╗███╗   ███╗
-    ██╔════╝██║██╔════╝████╗ ████║
-    ███████╗██║█████╗  ██╔████╔██║
-    ╚════██║██║██╔══╝  ██║╚██╔╝██║
-    ███████║██║███████╗██║ ╚═╝ ██║
-    ╚══════╝╚═╝╚══════╝╚═╝     ╚═╝
-    Made by BRACİHOSEC
-    Version {VERSION}
-    """)
-
-def clear_screen():
-    os.system('cls' if os.name == 'nt' else 'clear')
-
-# ========== NEW FILE SELECTION FUNCTIONS ==========
-def list_files_in_dir(directory: Path, extension: str):
-    """List files in directory with specific extension"""
-    return [f for f in directory.iterdir() if f.is_file() and f.suffix == extension]
-
-def choose_file_from_dir(directory: Path, extension: str, prompt: str):
-    """Interactive file selection from directory"""
-    files = list_files_in_dir(directory, extension)
-    if not files:
-        print(f"{directory} theres no {extension} file.")
-        return None
-    print(prompt)
-    for i, f in enumerate(files, 1):
-        print(f"{i}. {f.name}")
-    while True:
-        try:
-            choice = int(input(f"\nSelect one (1-{len(files)}): "))
-            if 1 <= choice <= len(files):
-                return files[choice - 1]
-            else:
-                print(f"write number{len(files)}.")
-        except ValueError:
-            print("Write an number accordingly")
-# ========== END OF NEW FUNCTIONS ==========
-
-def find_local_files(extensions):
-    """Find files with given extensions in current directory"""
-    files = []
-    for ext in extensions:
-        files.extend(list(Path.cwd().glob(f"*.{ext}")))
-    return sorted(files, key=lambda f: f.stat().st_mtime, reverse=True)
-
-def select_file(prompt, file_types, allow_custom=True):
-    """Let user select a file from local directory or enter custom path"""
-    # Find matching files
-    local_files = find_local_files(file_types)
-    
-    if local_files:
-        print(f"\n{prompt}")
-        print("Found these files in current directory:")
-        for i, file in enumerate(local_files, 1):
-            print(f"{i}. {file.name} (modified: {datetime.fromtimestamp(file.stat().st_mtime).strftime('%Y-%m-%d %H:%M')})")
-        
-        if allow_custom:
-            print(f"{len(local_files)+1}. Enter custom path")
-        
-        choice = input("\nSelect file or enter custom path: ").strip()
-        
-        try:
-            # Try to convert to integer selection
-            choice_num = int(choice)
-            if 1 <= choice_num <= len(local_files):
-                return local_files[choice_num-1]
-            if allow_custom and choice_num == len(local_files)+1:
-                return get_custom_path(file_types)
-        except ValueError:
-            # If not a number, treat as custom path
-            custom_path = Path(choice)
-            if custom_path.exists() and custom_path.suffix[1:] in file_types:
-                return custom_path
-            print(f"File not found or wrong type: {choice}")
-    
-    # If no files found or custom path needed
-    if allow_custom:
-        return get_custom_path(file_types)
-    
-    print("No matching files found in current directory")
-    return None
-
-def get_custom_path(file_types):
-    """Get custom file path from user with validation"""
-    while True:
-        path = input("Enter full path to file: ").strip()
-        if not path:
-            continue
-            
-        path = Path(path)
-        if not path.exists():
-            print(f"File not found: {path}")
-            continue
-            
-        if path.suffix[1:] not in file_types:
-            print(f"File must be one of these types: {', '.join(file_types)}")
-            continue
-            
-        return path
-
-def get_user_choice(prompt, options):
-    print(prompt)
-    for i, option in enumerate(options, 1):
-        print(f"{i}. {option}")
-    while True:
-        choice = input("\nEnter your choice: ").strip()
-        if choice.isdigit():
-            choice_num = int(choice)
-            if 1 <= choice_num <= len(options):
-                return choice_num
-        print(f"Please enter a number between 1 and {len(options)}")
 
 class BERTEmbedder:
     def __init__(self):
@@ -218,38 +110,47 @@ class PhishingDetector:
         }
 
 class SIEMDetector:
-    def __init__(self):
+    def __init__(self, model_path=None):
         self.embedder = BERTEmbedder()
         self.supervised_model = None
         self.unsupervised_model = None
         self.phishing_detector = PhishingDetector()
+        self.model_path = model_path or DEFAULT_MODEL
 
-    def train(self, jsonl_file: Path):
-        print(f"\n🚀 Training model with {jsonl_file.name}")
+    def train(self, jsonl_file: Path, progress_callback=None):
+        if progress_callback:
+            progress_callback(10, "Loading training data...")
         
         # Load training data
         logs, labels = [], []
         try:
             with open(jsonl_file, "r") as f:
-                for line in f:
+                total_lines = sum(1 for _ in f)
+                f.seek(0)
+                
+                for i, line in enumerate(f):
                     entry = json.loads(line)
                     logs.append(entry["log"])
                     labels.append(entry["label"])
-            print(f"Loaded {len(logs)} training examples")
+                    
+                    if progress_callback and i % 100 == 0:
+                        progress = 10 + int(70 * i / total_lines)
+                        progress_callback(progress, f"Loading data: {i}/{total_lines}")
+                        
+            if progress_callback:
+                progress_callback(80, "Generating embeddings...")
         except Exception as e:
-            print(f"❌ Error loading training data: {e}")
-            return
+            return False, f"Error loading training data: {e}"
 
         # Generate embeddings
-        print("🔧 Generating embeddings...")
         try:
             embeddings = self.embedder.embed_batch(logs)
         except Exception as e:
-            print(f"❌ Error generating embeddings: {e}")
-            return
+            return False, f"Error generating embeddings: {e}"
 
         # Train supervised model
-        print("🎓 Training classifier...")
+        if progress_callback:
+            progress_callback(85, "Training classifier...")
         try:
             self.supervised_model = RandomForestClassifier(
                 n_estimators=150, 
@@ -259,11 +160,11 @@ class SIEMDetector:
             )
             self.supervised_model.fit(embeddings, labels)
         except Exception as e:
-            print(f"❌ Error training classifier: {e}")
-            return
+            return False, f"Error training classifier: {e}"
 
         # Train unsupervised model
-        print("🔍 Training anomaly detector...")
+        if progress_callback:
+            progress_callback(90, "Training anomaly detector...")
         try:
             self.unsupervised_model = IsolationForest(
                 n_estimators=100, 
@@ -273,31 +174,32 @@ class SIEMDetector:
             )
             self.unsupervised_model.fit(embeddings)
         except Exception as e:
-            print(f"❌ Error training anomaly detector: {e}")
-            return
+            return False, f"Error training anomaly detector: {e}"
 
         # Save model
+        if progress_callback:
+            progress_callback(95, "Saving model...")
         try:
-            joblib.dump({
+            model_dict = {
                 "supervised": self.supervised_model, 
                 "unsupervised": self.unsupervised_model
-            }, DEFAULT_MODEL)
-            print(f"✅ Training complete! Model saved to {DEFAULT_MODEL}")
+            }
+            joblib.dump(model_dict, self.model_path)
+            return True, f"Training complete! Model saved to {self.model_path}"
         except Exception as e:
-            print(f"❌ Error saving model: {e}")
+            return False, f"Error saving model: {e}"
 
     def load_model(self):
-        if not DEFAULT_MODEL.exists():
-            print("❌ No trained model found. Please train a model first.")
-            return False
+        if not self.model_path.exists():
+            return False, f"Model not found: {self.model_path}"
+            
         try:
-            models = joblib.load(DEFAULT_MODEL)
+            models = joblib.load(self.model_path)
             self.supervised_model = models["supervised"]
             self.unsupervised_model = models["unsupervised"]
-            return True
+            return True, f"Loaded model: {self.model_path.name}"
         except Exception as e:
-            print(f"❌ Error loading model: {e}")
-            return False
+            return False, f"Error loading model: {e}"
 
     def analyze_log(self, log_entry):
         try:
@@ -323,33 +225,33 @@ class SIEMDetector:
                 "is_threat": supervised_pred == 1 or is_anomalous or phishing_result["has_phishing"]
             }
         except Exception as e:
-            print(f"⚠️ Error analyzing log: {e}")
+            logger.error(f"Error analyzing log: {e}")
             return None
 
-    def detect(self, json_file: Path):
-        if not self.load_model():
-            return
+    def detect(self, json_file: Path, progress_callback=None):
+        success, msg = self.load_model()
+        if not success:
+            return False, msg
             
-        print(f"\n🔍 Analyzing {json_file.name}")
-
         # Load log file
         try:
             with open(json_file, "r") as f:
                 logs = json.load(f)
             if not isinstance(logs, list):
                 logs = [logs]
-            print(f"Found {len(logs)} log entries to analyze")
         except Exception as e:
-            print(f"❌ Error loading log file: {e}")
-            return
+            return False, f"Error loading log file: {e}"
 
         # Process logs
         results = []
         threat_count = 0
         phishing_count = 0
         
-        print("\nProgress: [", end="", flush=True)
         for i, entry in enumerate(logs):
+            if progress_callback:
+                progress = int(100 * i / len(logs))
+                progress_callback(progress, f"Analyzing log {i+1}/{len(logs)}")
+                
             result = self.analyze_log(entry)
             if result is None:
                 continue
@@ -359,11 +261,6 @@ class SIEMDetector:
                 threat_count += 1
             if result["phishing_detection"]["has_phishing"]:
                 phishing_count += 1
-            
-            # Update progress every 2%
-            if i % max(1, len(logs)//50) == 0:
-                print("#", end="", flush=True)
-        print("] 100%")
 
         # Generate report
         report_name = f"report_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -372,27 +269,32 @@ class SIEMDetector:
             with open(report_file, "w") as f:
                 json.dump(results, f, indent=2)
         except Exception as e:
-            print(f"❌ Error saving report: {e}")
-            return
+            return False, f"Error saving report: {e}"
             
-        # Generate visualization
-        plot_file = self.generate_visualization(results, report_name)
-
-        # Show summary
-        print(f"\n📊 Analysis Results")
-        print("=" * 50)
-        print(f"Total logs processed: {len(results)}")
-        print(f"Potential threats detected: {threat_count}")
-        print(f"Phishing URLs found: {phishing_count}")
+        # Return data for visualization instead of generating it here
+        return True, {
+            "summary": self.get_summary(results, json_file.name),
+            "results": results,
+            "report_file": report_file,
+            "report_name": report_name
+        }
+    
+    def get_summary(self, results, filename):
+        threat_count = sum(1 for r in results if r["is_threat"])
+        phishing_count = sum(1 for r in results if r["phishing_detection"]["has_phishing"])
+        
+        summary = f"Analysis of {filename} complete!\n\n"
+        summary += f"Model used: {self.model_path.name}\n"
+        summary += f"Total logs processed: {len(results)}\n"
+        summary += f"Potential threats detected: {threat_count}\n"
+        summary += f"Phishing URLs found: {phishing_count}\n"
+        
         if results:
             anomaly_rate = sum(1 for r in results if r['is_anomalous']) / len(results)
-            print(f"Anomaly rate: {anomaly_rate:.2%}")
-        else:
-            print("No results to analyze")
-            return
-
+            summary += f"Anomaly rate: {anomaly_rate:.2%}\n"
+        
         if threat_count > 0:
-            print("\n🔔 Top threats:")
+            summary += "\nTop threats:\n"
             threats = sorted(
                 [r for r in results if r['is_threat']], 
                 key=lambda x: x['supervised_probability'], 
@@ -400,17 +302,13 @@ class SIEMDetector:
             )[:3]
             
             for i, threat in enumerate(threats, 1):
-                print(f"\n{i}. [Risk: {threat['supervised_probability']:.2%}]")
-                print(f"   {threat['log_text'][:100]}{'...' if len(threat['log_text']) > 100 else ''}")
+                summary += f"\n{i}. [Risk: {threat['supervised_probability']:.2%}]\n"
+                summary += f"   {threat['log_text'][:100]}{'...' if len(threat['log_text']) > 100 else ''}\n"
                 if threat['phishing_detection']['has_phishing']:
-                    print("   🚩 Contains phishing URL")
-
-        print("\n" + "=" * 50)
-        print(f"📂 Report saved to: {report_file}")
-        print(f"📈 Visualization saved to: {plot_file}")
-        print("=" * 50)
+                    summary += "   🚩 Contains phishing URL\n"
         
-        return results
+        summary += f"\nReport saved to: {REPORTS_DIR}/"
+        return summary
 
     def generate_visualization(self, results, report_name):
         if not results:
@@ -421,74 +319,444 @@ class SIEMDetector:
         phishing = sum(1 for r in results if r["phishing_detection"]["has_phishing"])
         supervised = sum(1 for r in results if r["supervised_prediction"] == 1)
 
-        plt.figure(figsize=(10, 6))
+        # Create plot safely in main thread
+        fig, ax = plt.subplots(figsize=(10, 6))
         categories = ["Normal", "Anomalies", "Phishing", "Known Threats"]
         counts = [normal, anomaly, phishing, supervised]
         colors = ["#4CAF50", "#FFC107", "#FF9800", "#F44336"]
-        bars = plt.bar(categories, counts, color=colors)
-        plt.title("Security Event Distribution")
-        plt.ylabel("Count")
+        bars = ax.bar(categories, counts, color=colors)
+        ax.set_title("Security Event Distribution")
+        ax.set_ylabel("Count")
 
         # Add count labels
         for bar in bars:
-            plt.text(
+            height = bar.get_height()
+            ax.text(
                 bar.get_x() + bar.get_width()/2, 
-                bar.get_height() + 0.5, 
-                str(int(bar.get_height())), 
+                height + 0.5, 
+                str(int(height)), 
                 ha='center'
             )
 
         # Add watermark
-        plt.figtext(0.5, 0.01, "Generated by SIEM Tool", ha="center", fontsize=10, alpha=0.7)
+        fig.text(0.5, 0.01, f"Generated by SIEM Tool v{VERSION}", ha="center", fontsize=10, alpha=0.7)
 
         plot_file = REPORTS_DIR / f"{report_name}_plot.png"
         try:
-            plt.savefig(plot_file, bbox_inches="tight")
-            plt.close()
+            fig.savefig(plot_file, bbox_inches="tight")
+            plt.close(fig)  # Important: close the figure to free memory
             return plot_file
         except Exception as e:
-            print(f"❌ Error saving visualization: {e}")
+            logger.error(f"Error saving visualization: {e}")
             return None
 
-# ========== NEW INTERACTIVE MODE ==========
-def interactive_mode():
-    clear_screen()
-    print_banner()
-    cwd = Path.cwd()
-    while True:
-        choice = get_user_choice("What would you like to do?", ["Train a new model", "Detect threats in logs", "Exit"])
-        if choice == 1:
-            clear_screen()
-            print("=" * 50)
-            print("🚀 MODEL TRAINING")
-            print("=" * 50)
-            print("Please select a JSONL file containing training data")
-            train_file = choose_file_from_dir(cwd, ".jsonl", "Available training files:")
-            if train_file:
-                SIEMDetector().train(train_file)
-            else:
-                print("No .jsonl files found.")
-            input("\nPress Enter to continue...")
-            clear_screen()
-            print_banner()
-        elif choice == 2:
-            clear_screen()
-            print("=" * 50)
-            print("🔍 THREAT DETECTION")
-            print("=" * 50)
-            print("Please select a JSON log file")
-            detect_file = choose_file_from_dir(cwd, ".json", "Available log files:")
-            if detect_file:
-                SIEMDetector().detect(detect_file)
-            else:
-                print("No .json files found.")
-            input("\nPress Enter to continue...")
-            clear_screen()
-            print_banner()
+class SIEMToolGUI(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title(f"SIEM Security Analyzer v{VERSION}")
+        self.geometry("900x700")
+        self.configure(bg="#f0f0f0")
+        self.detector = SIEMDetector()
+        self.current_model = DEFAULT_MODEL
+        self.create_widgets()
+        self.plot_queue = queue.Queue()
+        
+        # Center the window
+        self.update_idletasks()
+        width = self.winfo_width()
+        height = self.winfo_height()
+        x = (self.winfo_screenwidth() // 2) - (width // 2)
+        y = (self.winfo_screenheight() // 2) - (height // 2)
+        self.geometry(f'+{x}+{y}')
+        
+        # Start periodic check for plot generation
+        self.after(100, self.process_plot_queue)
+
+    def create_widgets(self):
+        # Create style
+        style = ttk.Style()
+        style.configure("TFrame", background="#f0f0f0")
+        style.configure("TButton", font=("Arial", 10), padding=6)
+        style.configure("Header.TLabel", font=("Arial", 16, "bold"), background="#f0f0f0")
+        style.configure("Title.TLabel", font=("Arial", 24, "bold"), background="#3f51b5", foreground="white")
+        
+        # Header frame
+        header_frame = ttk.Frame(self)
+        header_frame.pack(fill=tk.X, padx=10, pady=10)
+        
+        # Title
+        title_label = ttk.Label(header_frame, text="SIEM SECURITY ANALYZER", style="Title.TLabel")
+        title_label.pack(fill=tk.X, padx=10, pady=10)
+        
+        # Version and author
+        info_label = ttk.Label(header_frame, text=f"Version {VERSION} | Made by BRACİHOSEC", 
+                              font=("Arial", 9), background="#f0f0f0")
+        info_label.pack(pady=(0, 10))
+        
+        # Main content frame
+        main_frame = ttk.Frame(self)
+        main_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
+        
+        # Left panel - Actions
+        left_frame = ttk.Frame(main_frame)
+        left_frame.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 20))
+        
+        action_frame = ttk.LabelFrame(left_frame, text="Actions", padding=10)
+        action_frame.pack(fill=tk.X, pady=(0, 20))
+        
+        # Action buttons
+        ttk.Button(action_frame, text="Train New Model", command=self.train_model, 
+                  style="Accent.TButton").pack(fill=tk.X, pady=5)
+        ttk.Button(action_frame, text="Detect Threats", command=self.detect_threats, 
+                  style="Accent.TButton").pack(fill=tk.X, pady=5)
+        ttk.Button(action_frame, text="Select Model", command=self.select_model).pack(fill=tk.X, pady=5)
+        ttk.Button(action_frame, text="View Reports", command=self.view_reports).pack(fill=tk.X, pady=5)
+        ttk.Button(action_frame, text="Exit", command=self.destroy).pack(fill=tk.X, pady=5)
+        
+        # Model info
+        model_frame = ttk.LabelFrame(left_frame, text="Current Model", padding=10)
+        model_frame.pack(fill=tk.X)
+        
+        self.model_label = ttk.Label(model_frame, text="No model loaded", wraplength=200)
+        self.model_label.pack(fill=tk.X)
+        self.update_model_label()
+        
+        # Status bar
+        self.status_var = tk.StringVar(value="Ready")
+        status_bar = ttk.Label(self, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W)
+        status_bar.pack(side=tk.BOTTOM, fill=tk.X)
+        
+        # Right panel - Console
+        console_frame = ttk.LabelFrame(main_frame, text="Console Output", padding=10)
+        console_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+        
+        self.console = scrolledtext.ScrolledText(console_frame, wrap=tk.WORD, height=20)
+        self.console.pack(fill=tk.BOTH, expand=True)
+        self.console.configure(state=tk.DISABLED, font=("Consolas", 10))
+        
+        # Configure custom styles
+        style.configure("Accent.TButton", background="#4CAF50", foreground="white")
+        style.map("Accent.TButton", background=[("active", "#45a049")])
+        
+    def update_model_label(self):
+        if self.current_model.exists():
+            self.model_label.config(text=self.current_model.name)
         else:
-            print("👋 See ya!")
-            sys.exit(0)
-# ========== END OF NEW INTERACTIVE MODE ==========
+            self.model_label.config(text="No model loaded")
+        
+    def log_message(self, message):
+        self.console.configure(state=tk.NORMAL)
+        self.console.insert(tk.END, message + "\n")
+        self.console.see(tk.END)
+        self.console.configure(state=tk.DISABLED)
+        
+    def set_status(self, message):
+        self.status_var.set(message)
+        
+    def train_model(self):
+        file_path = filedialog.askopenfilename(
+            title="Select Training Data",
+            filetypes=[("JSONL files", "*.jsonl"), ("All files", "*.*")]
+        )
+        
+        if not file_path:
+            return
+            
+        # Create progress dialog
+        progress_dialog = tk.Toplevel(self)
+        progress_dialog.title("Training Model")
+        progress_dialog.geometry("400x150")
+        progress_dialog.transient(self)
+        progress_dialog.grab_set()
+        
+        # Center the dialog
+        progress_dialog.update_idletasks()
+        width = progress_dialog.winfo_width()
+        height = progress_dialog.winfo_height()
+        x = (self.winfo_screenwidth() // 2) - (width // 2)
+        y = (self.winfo_screenheight() // 2) - (height // 2)
+        progress_dialog.geometry(f'+{x}+{y}')
+        
+        ttk.Label(progress_dialog, text="Training model...").pack(pady=10)
+        
+        progress_var = tk.IntVar()
+        progress_bar = ttk.Progressbar(progress_dialog, variable=progress_var, maximum=100)
+        progress_bar.pack(fill=tk.X, padx=20, pady=5)
+        
+        status_var = tk.StringVar(value="Starting training...")
+        ttk.Label(progress_dialog, textvariable=status_var).pack(pady=5)
+        
+        def update_progress(progress, message):
+            progress_var.set(progress)
+            status_var.set(message)
+            progress_dialog.update()
+            
+        def training_thread():
+            try:
+                self.detector.model_path = self.current_model
+                success, message = self.detector.train(Path(file_path), update_progress)
+                
+                if success:
+                    self.log_message(f"Training successful!\n{message}")
+                    self.update_model_label()
+                    messagebox.showinfo("Training Complete", "Model trained successfully!")
+                else:
+                    self.log_message(f"Training failed: {message}")
+                    messagebox.showerror("Training Error", message)
+            except Exception as e:
+                self.log_message(f"Unexpected error: {str(e)}")
+                messagebox.showerror("Error", f"An unexpected error occurred: {str(e)}")
+            finally:
+                progress_dialog.destroy()
+                
+        threading.Thread(target=training_thread, daemon=True).start()
+        
+    def detect_threats(self):
+        file_path = filedialog.askopenfilename(
+            title="Select Log File",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")]
+        )
+        
+        if not file_path:
+            return
+            
+        # Create progress dialog
+        progress_dialog = tk.Toplevel(self)
+        progress_dialog.title("Analyzing Logs")
+        progress_dialog.geometry("400x150")
+        progress_dialog.transient(self)
+        progress_dialog.grab_set()
+        
+        # Center the dialog
+        progress_dialog.update_idletasks()
+        width = progress_dialog.winfo_width()
+        height = progress_dialog.winfo_height()
+        x = (self.winfo_screenwidth() // 2) - (width // 2)
+        y = (self.winfo_screenheight() // 2) - (height // 2)
+        progress_dialog.geometry(f'+{x}+{y}')
+        
+        ttk.Label(progress_dialog, text="Analyzing logs...").pack(pady=10)
+        
+        progress_var = tk.IntVar()
+        progress_bar = ttk.Progressbar(progress_dialog, variable=progress_var, maximum=100)
+        progress_bar.pack(fill=tk.X, padx=20, pady=5)
+        
+        status_var = tk.StringVar(value="Starting analysis...")
+        ttk.Label(progress_dialog, textvariable=status_var).pack(pady=5)
+        
+        def update_progress(progress, message):
+            progress_var.set(progress)
+            status_var.set(message)
+            progress_dialog.update()
+            
+        def detection_thread():
+            try:
+                self.detector.model_path = self.current_model
+                success, result = self.detector.detect(Path(file_path), update_progress)
+                
+                if success:
+                    # Add visualization task to queue to be processed in main thread
+                    self.plot_queue.put((result, file_path))
+                    self.log_message(f"Detection complete!\n{result['summary']}")
+                    messagebox.showinfo("Analysis Complete", "Threat detection completed successfully!")
+                else:
+                    self.log_message(f"Detection failed: {result}")
+                    messagebox.showerror("Detection Error", result)
+            except Exception as e:
+                self.log_message(f"Unexpected error: {str(e)}")
+                messagebox.showerror("Error", f"An unexpected error occurred: {str(e)}")
+            finally:
+                progress_dialog.destroy()
+                
+        threading.Thread(target=detection_thread, daemon=True).start()
+        
+    def process_plot_queue(self):
+        """Process visualization tasks from queue in main thread"""
+        try:
+            while not self.plot_queue.empty():
+                result, file_path = self.plot_queue.get_nowait()
+                
+                # Generate visualization in main thread
+                plot_file = self.detector.generate_visualization(
+                    result["results"], 
+                    result["report_name"]
+                )
+                
+                if plot_file:
+                    self.log_message(f"Visualization saved to: {plot_file}")
+                else:
+                    self.log_message("Failed to generate visualization")
+        except queue.Empty:
+            pass
+        
+        # Check again after 100ms
+        self.after(100, self.process_plot_queue)
+        
+    def select_model(self):
+        models = list(MODELS_DIR.glob("*.joblib"))
+        if not models:
+            messagebox.showinfo("No Models", "No trained models found. Please train a model first.")
+            return
+            
+        # Create selection dialog
+        model_dialog = tk.Toplevel(self)
+        model_dialog.title("Select Model")
+        model_dialog.geometry("500x300")
+        model_dialog.transient(self)
+        model_dialog.grab_set()
+        
+        # Center the dialog
+        model_dialog.update_idletasks()
+        width = model_dialog.winfo_width()
+        height = model_dialog.winfo_height()
+        x = (self.winfo_screenwidth() // 2) - (width // 2)
+        y = (self.winfo_screenheight() // 2) - (height // 2)
+        model_dialog.geometry(f'+{x}+{y}')
+        
+        ttk.Label(model_dialog, text="Select a model to use for detection:").pack(pady=10)
+        
+        # Create listbox with models
+        list_frame = ttk.Frame(model_dialog)
+        list_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=5)
+        
+        scrollbar = ttk.Scrollbar(list_frame)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        model_list = tk.Listbox(list_frame, yscrollcommand=scrollbar.set, font=("Arial", 11))
+        model_list.pack(fill=tk.BOTH, expand=True)
+        scrollbar.config(command=model_list.yview)
+        
+        for model in models:
+            model_list.insert(tk.END, model.name)
+            
+        # Set default selection to current model if available
+        if self.current_model in models:
+            idx = models.index(self.current_model)
+            model_list.select_set(idx)
+            model_list.see(idx)
+        
+        # Button frame
+        button_frame = ttk.Frame(model_dialog)
+        button_frame.pack(fill=tk.X, padx=20, pady=10)
+        
+        def select_and_close():
+            selection = model_list.curselection()
+            if selection:
+                self.current_model = models[selection[0]]
+                self.update_model_label()
+                self.log_message(f"Selected model: {self.current_model.name}")
+                model_dialog.destroy()
+        
+        ttk.Button(button_frame, text="Select", command=select_and_close).pack(side=tk.RIGHT)
+        ttk.Button(button_frame, text="Cancel", command=model_dialog.destroy).pack(side=tk.RIGHT, padx=5)
+        
+    def view_reports(self):
+        reports = list(REPORTS_DIR.glob("report_*.json"))
+        if not reports:
+            messagebox.showinfo("No Reports", "No analysis reports found.")
+            return
+            
+        # Create report viewer
+        report_dialog = tk.Toplevel(self)
+        report_dialog.title("View Reports")
+        report_dialog.geometry("800x600")
+        report_dialog.transient(self)
+        
+        # Center the dialog
+        report_dialog.update_idletasks()
+        width = report_dialog.winfo_width()
+        height = report_dialog.winfo_height()
+        x = (self.winfo_screenwidth() // 2) - (width // 2)
+        y = (self.winfo_screenheight() // 2) - (height // 2)
+        report_dialog.geometry(f'+{x}+{y}')
+        
+        # Header
+        header_frame = ttk.Frame(report_dialog)
+        header_frame.pack(fill=tk.X, padx=10, pady=10)
+        
+        ttk.Label(header_frame, text="Analysis Reports", font=("Arial", 14, "bold")).pack(side=tk.LEFT)
+        
+        # Report list
+        list_frame = ttk.LabelFrame(report_dialog, text="Available Reports")
+        list_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        
+        scrollbar = ttk.Scrollbar(list_frame)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        report_list = tk.Listbox(list_frame, yscrollcommand=scrollbar.set, font=("Arial", 11))
+        report_list.pack(fill=tk.BOTH, expand=True)
+        scrollbar.config(command=report_list.yview)
+        
+        for report in sorted(reports, reverse=True):
+            report_list.insert(tk.END, report.name)
+            
+        # Report viewer
+        view_frame = ttk.LabelFrame(report_dialog, text="Report Content")
+        view_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        
+        report_viewer = scrolledtext.ScrolledText(view_frame, wrap=tk.WORD)
+        report_viewer.pack(fill=tk.BOTH, expand=True)
+        report_viewer.configure(state=tk.DISABLED, font=("Consolas", 10))
+        
+        def show_report(event=None):
+            selection = report_list.curselection()
+            if not selection:
+                return
+                
+            report_file = reports[selection[0]]
+            try:
+                with open(report_file, "r") as f:
+                    content = json.load(f)
+                
+                # Format the report content
+                formatted = f"Report: {report_file.name}\n\n"
+                formatted += f"Total entries: {len(content)}\n"
+                
+                threats = sum(1 for r in content if r['is_threat'])
+                anomalies = sum(1 for r in content if r['is_anomalous'])
+                phishing = sum(1 for r in content if r['phishing_detection']['has_phishing'])
+                
+                formatted += f"Threats detected: {threats}\n"
+                formatted += f"Anomalies detected: {anomalies}\n"
+                formatted += f"Phishing URLs found: {phishing}\n\n"
+                
+                # Show top threats
+                if threats > 0:
+                    top_threats = sorted(
+                        [r for r in content if r['is_threat']], 
+                        key=lambda x: x['supervised_probability'], 
+                        reverse=True
+                    )[:5]
+                    
+                    formatted += "Top Threats:\n"
+                    for i, threat in enumerate(top_threats, 1):
+                        formatted += f"\n{i}. [Risk: {threat['supervised_probability']:.2%}]\n"
+                        formatted += f"   Log: {threat['log_text'][:150]}{'...' if len(threat['log_text']) > 150 else ''}\n"
+                        if threat['phishing_detection']['has_phishing']:
+                            formatted += "   🚩 Contains phishing URL\n"
+                
+                report_viewer.configure(state=tk.NORMAL)
+                report_viewer.delete(1.0, tk.END)
+                report_viewer.insert(tk.END, formatted)
+                report_viewer.configure(state=tk.DISABLED)
+            except Exception as e:
+                report_viewer.configure(state=tk.NORMAL)
+                report_viewer.delete(1.0, tk.END)
+                report_viewer.insert(tk.END, f"Error loading report: {str(e)}")
+                report_viewer.configure(state=tk.DISABLED)
+        
+        report_list.bind("<<ListboxSelect>>", show_report)
+        
+        # Buttons
+        button_frame = ttk.Frame(report_dialog)
+        button_frame.pack(fill=tk.X, padx=10, pady=10)
+        
+        ttk.Button(button_frame, text="Close", command=report_dialog.destroy).pack(side=tk.RIGHT)
+        
+        # Select first report by default
+        if reports:
+            report_list.selection_set(0)
+            report_list.event_generate("<<ListboxSelect>>")
 
 def command_line_mode():
     parser = argparse.ArgumentParser(description=f"SIEM Tool v{VERSION}")
@@ -496,11 +764,13 @@ def command_line_mode():
     
     # Train command
     train_parser = subparsers.add_parser("train", help="Train model from JSONL")
-    train_parser.add_argument("file", type=Path, help="Training data JSONL file", nargs='?', default=None)
+    train_parser.add_argument("file", type=Path, help="Training data JSONL file")
+    train_parser.add_argument("-o", "--output", type=Path, help="Output model file", default=DEFAULT_MODEL)
     
     # Detect command
     detect_parser = subparsers.add_parser("detect", help="Detect threats from JSON logs")
-    detect_parser.add_argument("file", type=Path, help="Log file JSON", nargs='?', default=None)
+    detect_parser.add_argument("file", type=Path, help="Log file JSON")
+    detect_parser.add_argument("-m", "--model", type=Path, help="Model file to use", default=DEFAULT_MODEL)
     
     # Info command
     subparsers.add_parser("info", help="Show system info")
@@ -509,18 +779,24 @@ def command_line_mode():
     detector = SIEMDetector()
 
     if args.command == "train":
-        file = args.file or select_file("Select training file:", ["jsonl"], allow_custom=True)
-        if file:
-            detector.train(file)
-        else:
-            print("No training file selected")
+        detector.model_path = args.output
+        success, message = detector.train(args.file)
+        print(message)
+        if not success:
+            sys.exit(1)
     
     elif args.command == "detect":
-        file = args.file or select_file("Select log file:", ["json"], allow_custom=True)
-        if file:
-            detector.detect(file)
+        detector.model_path = args.model
+        success, result = detector.detect(args.file)
+        if success:
+            print(result["summary"])
+            # Generate visualization for CLI
+            plot_file = detector.generate_visualization(result["results"], result["report_name"])
+            if plot_file:
+                print(f"Visualization saved to: {plot_file}")
         else:
-            print("No log file selected")
+            print(result)
+            sys.exit(1)
     
     elif args.command == "info":
         print(f"SIEM Tool v{VERSION}")
@@ -528,13 +804,20 @@ def command_line_mode():
         print(f"Reports directory: {REPORTS_DIR}")
         print(f"Logs directory: {LOGS_DIR}")
         print(f"Cache directory: {CACHE_DIR}")
-        print("\nCurrent directory files:")
-        files = find_local_files(["json", "jsonl"])
-        for file in files:
-            print(f"- {file.name}")
+        
+        print("\nAvailable models:")
+        models = list(MODELS_DIR.glob("*.joblib"))
+        for model in models:
+            print(f"- {model.name}")
+            
+        print("\nAvailable reports:")
+        reports = list(REPORTS_DIR.glob("report_*.json"))
+        for report in reports:
+            print(f"- {report.name}")
 
 if __name__ == "__main__":
     if len(sys.argv) > 1:
         command_line_mode()
     else:
-        interactive_mode()
+        app = SIEMToolGUI()
+        app.mainloop()
