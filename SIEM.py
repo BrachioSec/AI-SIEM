@@ -53,6 +53,31 @@ def print_banner():
 def clear_screen():
     os.system('cls' if os.name == 'nt' else 'clear')
 
+# ========== NEW FILE SELECTION FUNCTIONS ==========
+def list_files_in_dir(directory: Path, extension: str):
+    """List files in directory with specific extension"""
+    return [f for f in directory.iterdir() if f.is_file() and f.suffix == extension]
+
+def choose_file_from_dir(directory: Path, extension: str, prompt: str):
+    """Interactive file selection from directory"""
+    files = list_files_in_dir(directory, extension)
+    if not files:
+        print(f"{directory} theres no {extension} file.")
+        return None
+    print(prompt)
+    for i, f in enumerate(files, 1):
+        print(f"{i}. {f.name}")
+    while True:
+        try:
+            choice = int(input(f"\nSelect one (1-{len(files)}): "))
+            if 1 <= choice <= len(files):
+                return files[choice - 1]
+            else:
+                print(f"write number{len(files)}.")
+        except ValueError:
+            print("Write an number accordingly")
+# ========== END OF NEW FUNCTIONS ==========
+
 def find_local_files(extensions):
     """Find files with given extensions in current directory"""
     files = []
@@ -424,70 +449,45 @@ class SIEMDetector:
             print(f"❌ Error saving visualization: {e}")
             return None
 
+# ========== NEW INTERACTIVE MODE ==========
 def interactive_mode():
     clear_screen()
     print_banner()
-    
+    cwd = Path.cwd()
     while True:
-        print("\n" + "=" * 50)
-        print("SIEM Tool - Main Menu")
-        print("=" * 50)
-        choice = get_user_choice("What would you like to do?", [
-            "Train a new model",
-            "Detect threats in logs",
-            "Exit"
-        ])
-        
-        if choice == 1:  # Train
+        choice = get_user_choice("What would you like to do?", ["Train a new model", "Detect threats in logs", "Exit"])
+        if choice == 1:
             clear_screen()
             print("=" * 50)
             print("🚀 MODEL TRAINING")
             print("=" * 50)
             print("Please select a JSONL file containing training data")
-            print("Each line should contain a 'log' and 'label' (0=normal, 1=threat)\n")
-            
-            # Let user select file
-            train_file = select_file("Training files available:", ["jsonl"])
-            if not train_file:
-                input("\nPress Enter to return to menu...")
-                clear_screen()
-                print_banner()
-                continue
-                
-            print(f"\nSelected: {train_file.name}")
-            detector = SIEMDetector()
-            detector.train(train_file)
-            
-            input("\nPress Enter to return to menu...")
+            train_file = choose_file_from_dir(cwd, ".jsonl", "Available training files:")
+            if train_file:
+                SIEMDetector().train(train_file)
+            else:
+                print("No .jsonl files found.")
+            input("\nPress Enter to continue...")
             clear_screen()
             print_banner()
-            
-        elif choice == 2:  # Detect
+        elif choice == 2:
             clear_screen()
             print("=" * 50)
             print("🔍 THREAT DETECTION")
             print("=" * 50)
-            print("Please select a JSON file containing logs to analyze\n")
-            
-            # Let user select file
-            detect_file = select_file("Log files available:", ["json"])
-            if not detect_file:
-                input("\nPress Enter to return to menu...")
-                clear_screen()
-                print_banner()
-                continue
-                
-            print(f"\nSelected: {detect_file.name}")
-            detector = SIEMDetector()
-            detector.detect(detect_file)
-            
-            input("\nPress Enter to return to menu...")
+            print("Please select a JSON log file")
+            detect_file = choose_file_from_dir(cwd, ".json", "Available log files:")
+            if detect_file:
+                SIEMDetector().detect(detect_file)
+            else:
+                print("No .json files found.")
+            input("\nPress Enter to continue...")
             clear_screen()
             print_banner()
-            
-        elif choice == 3:  # Exit
-            print("\nThank you for using the SIEM Tool. Stay secure!")
+        else:
+            print("👋 See ya!")
             sys.exit(0)
+# ========== END OF NEW INTERACTIVE MODE ==========
 
 def command_line_mode():
     parser = argparse.ArgumentParser(description=f"SIEM Tool v{VERSION}")
